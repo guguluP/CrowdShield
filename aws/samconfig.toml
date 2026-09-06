@@ -1,0 +1,19 @@
+# CrowdShield — ap-south-2 (same as iOS Cognito / API)
+version = 0.1
+
+[default.global.parameters]
+stack_name = "crowdshield-phase1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+region = "ap-south-2"
+# No LambdaCodeBucket — SAM packages src/* automatically.
+# Set AlertEmail to your real inbox (optional; default in template is noreply@example.com)
+parameter_overrides = "EnvironmentName=dev VenueIdDefault=technova-festival-grounds AlertEmail=piyushgugulu@gmail.com"
+image_repositories = []

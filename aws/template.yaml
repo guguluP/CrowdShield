@@ -1,0 +1,1147 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CrowdShield Phase 1–6 — local CodeUri packaging (SAM resolve_s3). Incidents POST open to all authenticated users.
+  Cognito (Public / Command), HTTP API + Lambda, DynamoDB tables, GET /health.
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Name prefix for resources (keeps demos isolated).
+
+  VenueIdDefault:
+    Type: String
+    Default: technova-festival-grounds
+    Description: Default venue id used by the prototype.
+
+
+
+
+
+
+
+
+
+  BedrockModelId:
+    Type: String
+    Default: global.anthropic.claude-sonnet-4-6
+    Description: >
+      Bedrock model ID for AI incident summaries. ap-south-2 (Hyderabad)
+      requires a global cross-Region inference profile (the "global."
+      prefix) rather than a plain foundation-model ID — Anthropic models
+      aren't served on-demand directly from this region. Change here if you
+      redeploy to a region with direct on-demand access; no code change
+      required either way.
+
+  AlertEmail:
+    Type: String
+    Default: noreply@example.com
+    Description: >
+      Email for CloudWatch alarm SNS. Confirm the subscription email after deploy.
+      Override with your real address on deploy. Default avoids missing-parameter failures.
+
+
+
+
+
+# -----------------------------------------------------------------------------
+# Globals (shared Lambda settings — stay inside free tier)
+# -----------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 128
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref EnvironmentName
+        VENUE_ID_DEFAULT: !Ref VenueIdDefault
+        VENUE_STATE_TABLE: !Ref VenueStateTable
+        ALERTS_TABLE: !Ref AlertsTable
+        INCIDENTS_TABLE: !Ref IncidentsTable
+        RECOMMENDATIONS_TABLE: !Ref RecommendationsTable
+        VENUES_TABLE: !Ref VenuesTable
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+Resources:
+
+  # ===========================================================================
+  # Lambda — Cognito PostConfirmation trigger (Phase 3). Auto-adds every
+  # self-signed-up user to the Public group. Defined before the user pool so
+  # the pool's LambdaConfig can reference its ARN directly.
+  # ===========================================================================
+  PostConfirmationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-post-confirmation
+      CodeUri: src/post_confirmation/
+      Handler: app.handler
+      Description: CrowdShield Phase 3 — auto-assigns self-signup users to the Public group
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminAddUserToGroup
+              # Wildcarded to this account/region rather than !GetAtt
+              # CrowdShieldUserPool.Arn to avoid a circular dependency: this
+              # function's policy would need the pool's ARN, while the pool's
+              # LambdaConfig needs this function's ARN. Actual invocation is
+              # still locked to only this pool via PostConfirmationInvokePermission's
+              # SourceArn below, so this wildcard doesn't widen what can
+              # actually trigger the function — only what it's technically
+              # allowed to call if it were somehow invoked another way.
+              Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+
+  PostConfirmationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PostConfirmationFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt CrowdShieldUserPool.Arn
+
+  # ===========================================================================
+  # Cognito — self-signup users land in Public automatically via the
+  # PostConfirmation trigger above; Command is granted manually only.
+  # Free tier: typically 10,000 MAU for direct sign-in (Essentials/Lite)
+  # ===========================================================================
+  CrowdShieldUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub crowdshield-${EnvironmentName}-users
+      # Essentials unlocks passkeys/WebAuthn and managed login for later —
+      # free tier is 10,000 MAU/month indefinitely, no cost impact at this
+      # project's scale versus the previous (implicit) Lite tier.
+      #
+      # NOTE: WEB_AUTHN sign-in is deliberately NOT enabled yet. Native
+      # iOS/macOS passkeys require an Associated Domains entitlement (paid
+      # Apple Developer Program only) and a domain hosting
+      # /.well-known/apple-app-site-association over HTTPS — neither exists
+      # for this project yet. Enabling WEB_AUTHN as a first factor without
+      # those in place would let a client attempt passkey registration and
+      # hit an unresolvable dead end rather than a clean "not supported".
+      # Add SignInPolicy.AllowedFirstAuthFactors: [PASSWORD, WEB_AUTHN] and
+      # WebAuthnRelyingPartyId once both prerequisites are real.
+      UserPoolTier: ESSENTIALS
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      MfaConfiguration: 'OFF'
+      LambdaConfig:
+        PostConfirmation: !GetAtt PostConfirmationFunction.Arn
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: false
+          Mutable: true
+      UserPoolTags:
+        Project: CrowdShield
+        Phase: '7'
+
+  CrowdShieldUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub crowdshield-${EnvironmentName}-ios
+      UserPoolId: !Ref CrowdShieldUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders: [COGNITO]
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  PublicUserGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Public
+      Description: Attendees — map / alerts / report only
+      UserPoolId: !Ref CrowdShieldUserPool
+      Precedence: 20
+
+  CommandUserGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Command
+      Description: Control-room operators — full dashboard + ack
+      UserPoolId: !Ref CrowdShieldUserPool
+      Precedence: 10
+
+  # ===========================================================================
+  # DynamoDB — Venues registry (Phase 6). venueId is a slug (lowercase,
+  # hyphenated) generated from the display name at creation time. Any
+  # authenticated Command user can create a venue; both roles can list/read.
+  # ===========================================================================
+  VenuesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub crowdshield-${EnvironmentName}-venues
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: venueId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: venueId
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: CrowdShield
+
+  # ===========================================================================
+  # DynamoDB — provisioned capacity stays within Always Free (25 RCU / 25 WCU)
+  # TTL on telemetry so demo data does not grow forever
+  # ===========================================================================
+  VenueStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub crowdshield-${EnvironmentName}-venue-state
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: venueId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: venueId
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      Tags:
+        - Key: Project
+          Value: CrowdShield
+
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub crowdshield-${EnvironmentName}-alerts
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: venueId
+          AttributeType: S
+        - AttributeName: alertId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: venueId
+          KeyType: HASH
+        - AttributeName: alertId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      Tags:
+        - Key: Project
+          Value: CrowdShield
+
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub crowdshield-${EnvironmentName}-incidents
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: venueId
+          AttributeType: S
+        - AttributeName: incidentId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: venueId
+          KeyType: HASH
+        - AttributeName: incidentId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      Tags:
+        - Key: Project
+          Value: CrowdShield
+
+  RecommendationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub crowdshield-${EnvironmentName}-recommendations
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: venueId
+          AttributeType: S
+        - AttributeName: recommendationId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: venueId
+          KeyType: HASH
+        - AttributeName: recommendationId
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      Tags:
+        - Key: Project
+          Value: CrowdShield
+
+  # ===========================================================================
+  # DynamoDB — WebSocket connections (Phase 4). Tracks which connectionIds
+  # are subscribed to which venue, so the broadcast Lambda knows who to push
+  # updates to. TTL cleans up stale rows if $disconnect is ever missed
+  # (e.g. abrupt network loss) rather than leaking connections forever.
+  # ===========================================================================
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub crowdshield-${EnvironmentName}-connections
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+        - AttributeName: venueId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: byVenue
+          KeySchema:
+            - AttributeName: venueId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: CrowdShield
+
+  # ===========================================================================
+  # Lambda — health check (Phase 1). More routes in later phases.
+  # ===========================================================================
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-health
+      CodeUri: src/health/
+      Handler: app.handler
+      Description: CrowdShield Phase 1 health endpoint
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref VenueStateTable
+      Events:
+        HealthGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /health
+            Method: GET
+            Auth:
+              Authorizer: NONE
+
+  # ===========================================================================
+  # Lambda — Venue State (Phase 2). PUT/GET, open to any authenticated caller.
+  # ===========================================================================
+  VenueStateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-venue-state
+      CodeUri: src/venue_state/
+      Handler: app.handler
+      Description: CrowdShield Phase 2 — venue crowd-state read/write
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VenueStateTable
+      Events:
+        StateGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues/{venueId}/state
+            Method: GET
+        StatePut:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues/{venueId}/state
+            Method: PUT
+
+  # ===========================================================================
+  # Lambda — Alerts (Phase 2). POST is Command-only (enforced in code).
+  # ===========================================================================
+  AlertsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-alerts
+      CodeUri: src/alerts/
+      Handler: app.handler
+      Description: CrowdShield Phase 2 — alerts read/write
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AlertsTable
+      Events:
+        AlertsGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues/{venueId}/alerts
+            Method: GET
+        AlertsPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues/{venueId}/alerts
+            Method: POST
+
+  # ===========================================================================
+  # Lambda — Incidents (Phase 2). POST is Command-only (enforced in code).
+  # ===========================================================================
+  IncidentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-incidents
+      CodeUri: src/incidents/
+      Handler: app.handler
+      Description: CrowdShield Phase 2 — incidents read/write
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+      Events:
+        IncidentsGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues/{venueId}/incidents
+            Method: GET
+        IncidentsPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues/{venueId}/incidents
+            Method: POST
+
+  # ===========================================================================
+  # Lambda — Recommendations (Phase 2). POST is Command-only (enforced in code).
+  # ===========================================================================
+  RecommendationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-recommendations
+      CodeUri: src/recommendations/
+      Handler: app.handler
+      Description: CrowdShield Phase 2 — recommendations read/write
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RecommendationsTable
+      Events:
+        RecommendationsGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues/{venueId}/recommendations
+            Method: GET
+        RecommendationsPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues/{venueId}/recommendations
+            Method: POST
+
+  # ===========================================================================
+  # Lambda — Venues registry (Phase 6). GET is open to any authenticated
+  # user; POST (create) is Command-only, enforced in code.
+  # ===========================================================================
+  VenuesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-venues
+      CodeUri: src/venues/
+      Handler: app.handler
+      Description: CrowdShield Phase 6 — venue registry read/write
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VenuesTable
+      Events:
+        VenuesGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues
+            Method: GET
+        VenuesPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues
+            Method: POST
+
+  # ===========================================================================
+  # Lambda — Bedrock incident summary (Stage 1). Any authenticated user can
+  # request a summary; it's a read/derive operation, not a write, so it
+  # doesn't need Command-only gating the way alerts/incidents/recommendations
+  # writes do.
+  # ===========================================================================
+  SummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-summary
+      CodeUri: src/summary/
+      Handler: app.handler
+      Timeout: 30
+      Description: CrowdShield Stage 1 — Bedrock-generated incident summaries
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref VenueStateTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AlertsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource:
+                # The inference profile itself, in this (source) region —
+                # required to invoke a "global." prefixed model ID at all.
+                - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+                # Global cross-Region inference can route the actual
+                # inference to any commercial AWS region, not just this
+                # one — AWS's own docs for global CRIS require granting
+                # foundation-model invoke permission across regions, not
+                # just the source region, or requests fail once routed
+                # elsewhere. Wildcarding the region segment (rather than
+                # enumerating every possible destination) is the
+                # documented approach for this exact scenario.
+                - 'arn:aws:bedrock:*::foundation-model/*'
+      Events:
+        SummaryPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /venues/{venueId}/summary
+            Method: POST
+
+  # ===========================================================================
+  # HTTP API — cheaper than REST; JWT authorizer reserved for Phase 2
+  # ===========================================================================
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref EnvironmentName
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - OPTIONS
+      Auth:
+        Authorizers:
+          CrowdShieldJwtAuthorizer:
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CrowdShieldUserPool}'
+              audience:
+                - !Ref CrowdShieldUserPoolClient
+            IdentitySource: '$request.header.Authorization'
+        DefaultAuthorizer: CrowdShieldJwtAuthorizer
+      Tags:
+        Project: CrowdShield
+        Phase: '2'
+
+  # ===========================================================================
+  # WebSocket API (Phase 4) — real-time push for alerts/incidents/
+  # recommendations/venue-state. Defined with raw ApiGatewayV2 resources
+  # rather than SAM's HttpApi shorthand, since WebSocket protocol support
+  # needs explicit routes/integrations/deployment that SAM doesn't
+  # abstract the way it does for HTTP APIs.
+  # ===========================================================================
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub crowdshield-${EnvironmentName}-ws
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.action'
+      Tags:
+        Project: CrowdShield
+        Phase: '4'
+
+  # --- $connect ---
+  WsConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-ws-connect
+      CodeUri: src/ws_connect/
+      Handler: app.handler
+      Description: CrowdShield Phase 4 — WebSocket $connect (verifies token, registers connection)
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          USER_POOL_ID: !Ref CrowdShieldUserPool
+          USER_POOL_CLIENT_ID: !Ref CrowdShieldUserPoolClient
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+
+  WsConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WsConnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  WsConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations'
+
+  WsConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      Target: !Sub 'integrations/${WsConnectIntegration}'
+
+  # --- $disconnect ---
+  WsDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-ws-disconnect
+      CodeUri: src/ws_disconnect/
+      Handler: app.handler
+      Description: CrowdShield Phase 4 — WebSocket $disconnect (removes connection)
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+
+  WsDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WsDisconnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  WsDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsDisconnectFunction.Arn}/invocations'
+
+  WsDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub 'integrations/${WsDisconnectIntegration}'
+
+  # --- Deployment / stage ---
+  # Explicit DependsOn ensures the deployment is created only after both
+  # routes exist — ApiGatewayV2 deployments silently omit routes added
+  # after the deployment resource if CloudFormation orders them wrong.
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - WsConnectRoute
+      - WsDisconnectRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      DeploymentId: !Ref WebSocketDeployment
+      StageName: !Ref EnvironmentName
+      Tags:
+        Project: CrowdShield
+        Phase: '4'
+
+  # --- Broadcast (triggered by DynamoDB Streams, not a WebSocket route) ---
+  WsBroadcastFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub crowdshield-${EnvironmentName}-ws-broadcast
+      CodeUri: src/ws_broadcast/
+      Handler: app.handler
+      Timeout: 30
+      Description: CrowdShield Phase 4 — pushes DynamoDB Stream changes to subscribed WebSocket connections
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          WEBSOCKET_MANAGEMENT_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ConnectionsTable
+        - DynamoDBWritePolicy:
+            TableName: !Ref ConnectionsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/${EnvironmentName}/POST/@connections/*'
+            - Effect: Allow
+              Action:
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+                - dynamodb:DescribeStream
+                - dynamodb:ListStreams
+              Resource:
+                - !GetAtt VenueStateTable.StreamArn
+                - !GetAtt AlertsTable.StreamArn
+                - !GetAtt IncidentsTable.StreamArn
+                - !GetAtt RecommendationsTable.StreamArn
+
+  WsBroadcastVenueStateSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref WsBroadcastFunction
+      EventSourceArn: !GetAtt VenueStateTable.StreamArn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 1
+
+  WsBroadcastAlertsSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref WsBroadcastFunction
+      EventSourceArn: !GetAtt AlertsTable.StreamArn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 1
+
+  WsBroadcastIncidentsSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref WsBroadcastFunction
+      EventSourceArn: !GetAtt IncidentsTable.StreamArn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 1
+
+  WsBroadcastRecommendationsSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref WsBroadcastFunction
+      EventSourceArn: !GetAtt RecommendationsTable.StreamArn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 1
+
+
+  # ===========================================================================
+  # CloudWatch Monitoring (final stage). One SNS topic fans out to email for
+  # every Lambda's error-rate alarm plus both APIs' 5xx-rate alarms — the
+  # goal isn't exhaustive observability, it's catching exactly the class of
+  # failure this project has actually hit before (missing env vars, wrong
+  # region/model IDs, actor-isolation crashes) automatically rather than
+  # only via manual curl testing after the fact.
+  # ===========================================================================
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub crowdshield-${EnvironmentName}-alerts
+      DisplayName: CrowdShield Alarms
+
+  AlertsTopicEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # --- HTTP API 5xx rate ---
+  HttpApi5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-http-api-5xx
+      AlarmDescription: HTTP API is returning server errors (5xx) in the last 5 minutes.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref HttpApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # --- WebSocket API errors (ClientError + ExecutionError combined via two alarms) ---
+  WebSocketApiExecutionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-ws-api-execution-errors
+      AlarmDescription: WebSocket API integration/execution errors (e.g. broadcast Lambda failures) in the last 5 minutes.
+      Namespace: AWS/ApiGateway
+      MetricName: ExecutionError
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref WebSocketApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  PostConfirmationFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-PostConfirmationFunction-errors
+      AlarmDescription: !Sub "PostConfirmationFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PostConfirmationFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  HealthFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-HealthFunction-errors
+      AlarmDescription: !Sub "HealthFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref HealthFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  VenueStateFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-VenueStateFunction-errors
+      AlarmDescription: !Sub "VenueStateFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref VenueStateFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  AlertsFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-AlertsFunction-errors
+      AlarmDescription: !Sub "AlertsFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AlertsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  IncidentsFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-IncidentsFunction-errors
+      AlarmDescription: !Sub "IncidentsFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IncidentsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  RecommendationsFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-RecommendationsFunction-errors
+      AlarmDescription: !Sub "RecommendationsFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RecommendationsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  VenuesFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-VenuesFunction-errors
+      AlarmDescription: !Sub "VenuesFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref VenuesFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  SummaryFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-SummaryFunction-errors
+      AlarmDescription: !Sub "SummaryFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SummaryFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  WsConnectFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-WsConnectFunction-errors
+      AlarmDescription: !Sub "WsConnectFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WsConnectFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  WsDisconnectFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-WsDisconnectFunction-errors
+      AlarmDescription: !Sub "WsDisconnectFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WsDisconnectFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  WsBroadcastFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub crowdshield-${EnvironmentName}-WsBroadcastFunction-errors
+      AlarmDescription: !Sub "WsBroadcastFunction has logged Lambda errors in the last 5 minutes."
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WsBroadcastFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+# -----------------------------------------------------------------------------
+# Outputs — copy these into the iOS app / Amplify config later
+# -----------------------------------------------------------------------------
+Outputs:
+  AlertsTopicArn:
+    Description: >
+      SNS topic all CloudWatch alarms publish to. Check your email (the
+      AlertEmail parameter value) for a subscription-confirmation link
+      after first deploy — alarms won't actually notify you until that's
+      confirmed.
+    Value: !Ref AlertsTopic
+
+  ApiEndpoint:
+    Description: Base URL for CrowdShield HTTP API
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+
+  WebSocketUrl:
+    Description: >
+      WebSocket URL for real-time push. Connect with
+      wss://.../{stage}?token=<Cognito ID token>&venueId=<venue id>
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+
+  HealthUrl:
+    Description: Phase 1 health check — open in browser, expect 200
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/health'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CrowdShieldUserPool
+
+  UserPoolClientId:
+    Description: Cognito App Client ID (iOS)
+    Value: !Ref CrowdShieldUserPoolClient
+
+  UserPoolArn:
+    Description: Cognito User Pool ARN (for API JWT authorizer in Phase 2)
+    Value: !GetAtt CrowdShieldUserPool.Arn
+
+  VenueStateTableName:
+    Value: !Ref VenueStateTable
+  AlertsTableName:
+    Value: !Ref AlertsTable
+  IncidentsTableName:
+    Value: !Ref IncidentsTable
+  RecommendationsTableName:
+    Value: !Ref RecommendationsTable
+
+  VenueStateUrlTemplate:
+    Description: PUT/GET this with a real venueId in place of {venueId}
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/venues/{venueId}/state'
+
+  AlertsUrlTemplate:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/venues/{venueId}/alerts'
+
+  IncidentsUrlTemplate:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/venues/{venueId}/incidents'
+
+  RecommendationsUrlTemplate:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/venues/{venueId}/recommendations'
+
+  VenuesUrl:
+    Description: GET to list venues, POST (Command only) to create one
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/venues'
+
+  SummaryUrlTemplate:
+    Description: POST to generate a fresh AI incident summary for a venue
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/venues/{venueId}/summary'
+
+  Region:
+    Value: !Ref AWS::Region

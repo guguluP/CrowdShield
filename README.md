@@ -68,38 +68,27 @@ Both roles are enforced **server-side** via Cognito group membership in the JWT 
 - **Alert debouncing** — a two-layer persistence + cooldown system so a single noisy sensor tick can't fire an alert, and a flickering condition can't spam the same alert repeatedly.
 - **Liquid Glass UI** — adaptive `.glassEffect` on iOS/macOS 26+, with a graceful `.ultraThinMaterial` fallback on older OS versions, and role-aware accent theming (cyan for Public, amber for Command) throughout.
 
+> **Screenshots:** none are checked into this repo yet. Build and run the `CrowdShield` scheme on a device or Mac (see [Getting Started](#getting-started)) to see the Command dashboard, Digital Twin, and Public map firsthand — happy to add real screenshots here once captured. In the meantime, the [architecture diagrams](#architecture) below cover how the pieces fit together.
+
 ---
 
 ## Architecture
 
-```
-┌─────────────────────────────┐         ┌──────────────────────────────────────────┐
-│   CrowdShield (SwiftUI)     │         │              AWS Backend (SAM)            │
-│                              │         │                                            │
-│  ┌────────────┐             │  HTTPS  │  ┌──────────┐    ┌─────────────────────┐  │
-│  │ Public UI  │◄───────────►│────────►│  │ HTTP API │───►│ Lambda (per domain) │  │
-│  ├────────────┤   REST/JSON │         │  │ (JWT     │    │ health · venue-state│  │
-│  │ Command UI │             │         │  │ auth)    │    │ alerts · incidents  │  │
-│  └────────────┘             │         │  └──────────┘    │ recommendations     │  │
-│        ▲                    │         │                  │ venues · summary    │  │
-│        │  WebSocket (live)  │  WSS    │  ┌──────────┐    └──────────┬──────────┘  │
-│        └────────────────────│────────►│  │WebSocket │               │             │
-│                              │         │  │   API    │        DynamoDB (7 tables) │
-│  On-device (offline path):  │         │  └────┬─────┘               │             │
-│   • RiskPredictionEngine    │         │       │               DynamoDB Streams    │
-│   • EvacuationRoutingEngine │         │       ▼                     │             │
-│   • FlowAnalysisEngine      │         │  ws-connect/disconnect      ▼             │
-│   • DigitalTwinProjection   │         │       ▲              ws-broadcast Lambda  │
-│   • FoundationModels (AFM)  │         │       └──────── pushes live changes ──────┘
-│                              │         │                                            │
-└─────────────┬────────────────┘         │  Cognito User Pool (Public / Command groups)│
-              │                          │  Bedrock (Claude, cross-Region inference)   │
-       CrowdSimulationService            │  CloudWatch Alarms → SNS email alerts       │
-       (orchestrates everything,         └──────────────────────────────────────────┘
-        drives the 3s simulation tick)
-```
+<p align="center">
+  <img src="docs/images/architecture-overview.svg" alt="CrowdShield system architecture: a SwiftUI client with on-device prediction engines talks to an AWS SAM backend (Cognito, HTTP API, seven Lambda functions, DynamoDB, WebSocket API, Bedrock, CloudWatch) over HTTPS and WebSocket" width="100%">
+</p>
 
 **Design principle:** every prediction engine on the client (risk, evacuation, flow, panic) works standalone on simulated/local sensor data, so the app is fully demoable offline. The AWS layer adds real auth, persistence, cross-device real-time sync, and a server-side LLM summary — but nothing about the safety logic *depends* on the network being up.
+
+### How a change reaches every screen in real time
+
+The most distinctive piece of the backend isn't any single Lambda — it's the DynamoDB Streams → broadcast fan-out that turns one write into a live update on every connected device, Public and Command alike, with no polling anywhere in the client:
+
+<p align="center">
+  <img src="docs/images/realtime-data-flow.svg" alt="Sequence diagram: a Command app POSTs an incident, an Incidents Lambda writes it to DynamoDB, the write triggers a DynamoDB Stream event, a ws-broadcast Lambda looks up subscribed connections for that venue in the Connections table, and pushes the update to every Public and Command device connected to that venue over WebSocket" width="100%">
+</p>
+
+This same path — write → stream → broadcast Lambda → connection lookup → push — is what drives live updates for venue state, alerts, incidents, *and* recommendations. It's one mechanism reused for every real-time feature in the app, rather than a bespoke pipeline per feature.
 
 ---
 
